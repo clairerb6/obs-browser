@@ -7,6 +7,7 @@
 #cmake
 /cmbuild/
 /build/
+/build-*/
 /build32/
 /build64/
 /release/
@@ -20,6 +21,19 @@
 *.ninja
 .ninja*
 .dirstamp
+
+#generated build files (in-source cmake/qt)
+/CMakeCache.txt
+/CMakeFiles/
+/cmake_install.cmake
+/compile_commands.json
+/CTestTestfile.cmake
+/install_manifest.txt
+/obs-browser_autogen/
+/Testing/
+/_CPack_Packages/
+/CPackConfig.cmake
+/CPackSourceConfig.cmake
 
 #xcode
 *.xcodeproj/

@@ -11,6 +11,7 @@ class QCefBrowserClient : public CefClient,
 			  public CefLifeSpanHandler,
 			  public CefContextMenuHandler,
 			  public CefLoadHandler,
+			  public CefRenderHandler,
 			  public CefKeyboardHandler,
 			  public CefFocusHandler,
 			  public CefJSDialogHandler {
@@ -32,6 +33,7 @@ public:
 	virtual CefRefPtr<CefFocusHandler> GetFocusHandler() override;
 	virtual CefRefPtr<CefContextMenuHandler> GetContextMenuHandler() override;
 	virtual CefRefPtr<CefJSDialogHandler> GetJSDialogHandler() override;
+	virtual CefRefPtr<CefRenderHandler> GetRenderHandler() override;
 
 	/* CefDisplayHandler */
 	virtual void OnTitleChange(CefRefPtr<CefBrowser> browser, const CefString &title) override;
@@ -85,6 +87,12 @@ public:
 				 TransitionType transition_type) override;
 
 	virtual void OnLoadEnd(CefRefPtr<CefBrowser> browser, CefRefPtr<CefFrame> frame, int httpStatusCode) override;
+
+	/* CefRenderHandler (windowless panel rendering) */
+	virtual void GetViewRect(CefRefPtr<CefBrowser> browser, CefRect &rect) override;
+	virtual void OnPaint(CefRefPtr<CefBrowser> browser, PaintElementType type,
+			     const RectList &dirtyRects, const void *buffer,
+			     int width, int height) override;
 
 	/* CefKeyboardHandler */
 	virtual bool OnPreKeyEvent(CefRefPtr<CefBrowser> browser, const CefKeyEvent &event, CefEventHandle os_event,

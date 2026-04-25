@@ -1,6 +1,11 @@
 find_package(X11 REQUIRED)
-find_package(Libdrm REQUIRED)
-get_target_property(libdrm_include_directories Libdrm::Libdrm INTERFACE_INCLUDE_DIRECTORIES)
+find_package(Libdrm QUIET)
+if(TARGET Libdrm::Libdrm)
+  get_target_property(libdrm_include_directories Libdrm::Libdrm INTERFACE_INCLUDE_DIRECTORIES)
+elseif(PkgConfig_FOUND)
+  pkg_check_modules(LIBDRM REQUIRED libdrm)
+  set(libdrm_include_directories ${LIBDRM_INCLUDE_DIRS})
+endif()
 
 target_include_directories(obs-browser PRIVATE ${libdrm_include_directories})
 
@@ -16,21 +21,35 @@ target_sources(
   browser-helper PRIVATE # cmake-format: sortable
                          browser-app.cpp browser-app.hpp cef-headers.hpp obs-browser-page/obs-browser-page-main.cpp)
 
-target_include_directories(browser-helper PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/deps"
+target_include_directories(browser-helper PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}"
+                                                  "${CMAKE_CURRENT_SOURCE_DIR}/deps"
                                                   "${CMAKE_CURRENT_SOURCE_DIR}/obs-browser-page")
 
 target_link_libraries(browser-helper PRIVATE CEF::Wrapper CEF::Library)
+target_compile_features(browser-helper PRIVATE cxx_std_20)
 
 target_sources(obs-browser PRIVATE deps/ip-string-posix.cpp)
 
+if(NOT DEFINED OBS_PLUGIN_DESTINATION)
+  set(OBS_PLUGIN_DESTINATION "lib/obs-plugins")
+endif()
 set(OBS_EXECUTABLE_DESTINATION "${OBS_PLUGIN_DESTINATION}")
 
 # cmake-format: off
-set_target_properties_obs(
-  browser-helper
-  PROPERTIES FOLDER plugins/obs-browser
-             BUILD_RPATH "$ORIGIN/"
-             INSTALL_RPATH "$ORIGIN/"
-             PREFIX ""
-             OUTPUT_NAME obs-browser-page)
+if(COMMAND set_target_properties_obs)
+  set_target_properties_obs(
+    browser-helper
+    PROPERTIES FOLDER plugins/obs-browser
+               BUILD_RPATH "$ORIGIN/"
+               INSTALL_RPATH "$ORIGIN/"
+               PREFIX ""
+               OUTPUT_NAME obs-browser-page)
+else()
+  set_target_properties(
+    browser-helper
+    PROPERTIES BUILD_RPATH "$ORIGIN/"
+               INSTALL_RPATH "$ORIGIN/"
+               PREFIX ""
+               OUTPUT_NAME obs-browser-page)
+endif()
 # cmake-format: on

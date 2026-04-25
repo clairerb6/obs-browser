@@ -5,6 +5,13 @@
 
 #include <QWindow>
 #include <QApplication>
+#include <QGuiApplication>
+#include <QPainter>
+#include <QMouseEvent>
+#include <QWheelEvent>
+#include <QFocusEvent>
+#include <QHideEvent>
+#include <QInputMethodEvent>
 
 #ifdef ENABLE_BROWSER_QT_LOOP
 #include <QEventLoop>
@@ -23,6 +30,7 @@
 
 #if !defined(_WIN32) && !defined(__APPLE__)
 #include <X11/Xlib.h>
+#include "linux-keyboard-helpers.hpp"
 #endif
 
 extern bool QueueCEFTask(std::function<void()> task);
@@ -32,6 +40,12 @@ extern os_event_t *cef_started_event;
 std::mutex popup_whitelist_mutex;
 std::vector<PopupWhitelistInfo> popup_whitelist;
 std::vector<PopupWhitelistInfo> forced_popups;
+
+static bool IsWaylandQtPlatform()
+{
+	const QString platformName = QGuiApplication::platformName().toLower();
+	return platformName.contains("wayland");
+}
 
 static int zoomLvls[] = {25, 33, 50, 67, 75, 80, 90, 100, 110, 125, 150, 175, 200, 250, 300, 400};
 
@@ -166,28 +180,44 @@ QCefWidgetInternal::QCefWidgetInternal(QWidget *parent, const std::string &url_,
 	  url(url_),
 	  rqc(rqc_)
 {
-	setAttribute(Qt::WA_PaintOnScreen);
-	setAttribute(Qt::WA_StaticContents);
-	setAttribute(Qt::WA_NoSystemBackground);
-	setAttribute(Qt::WA_OpaquePaintEvent);
-	setAttribute(Qt::WA_DontCreateNativeAncestors);
-	setAttribute(Qt::WA_NativeWindow);
+	if (IsWaylandQtPlatform()) {
+		// Wayland panel path: use windowless rendering to avoid detached
+		// compositor toplevel windows for each dock.
+		windowlessMode_ = true;
+		setAttribute(Qt::WA_NoSystemBackground);
+		setAttribute(Qt::WA_OpaquePaintEvent);
+		setMouseTracking(true);
+	} else {
+		setAttribute(Qt::WA_PaintOnScreen);
+		setAttribute(Qt::WA_StaticContents);
+		setAttribute(Qt::WA_NoSystemBackground);
+		setAttribute(Qt::WA_OpaquePaintEvent);
+		setAttribute(Qt::WA_DontCreateNativeAncestors);
+		setAttribute(Qt::WA_NativeWindow);
+	}
 
 	setFocusPolicy(Qt::ClickFocus);
+	setAttribute(Qt::WA_InputMethodEnabled, true);
+	UpdateOffscreenSizeCache();
 
 #ifndef __APPLE__
-	window = new QWindow();
-	window->setFlags(Qt::FramelessWindowHint);
+	if (!windowlessMode_) {
+		window = new QWindow();
+		window->setFlags(Qt::FramelessWindowHint);
+	}
 #endif
 }
 
 QCefWidgetInternal::~QCefWidgetInternal()
 {
+	browserClosing_.store(true, std::memory_order_relaxed);
 	closeBrowser();
 }
 
 void QCefWidgetInternal::closeBrowser()
 {
+	browserClosing_.store(true, std::memory_order_relaxed);
+
 	if (!cefBrowser) {
 		return;
 	}
@@ -233,6 +263,61 @@ void QCefWidgetInternal::closeBrowser()
 	cefBrowser = nullptr;
 }
 
+void QCefWidgetInternal::UpdateOffscreenSizeCache()
+{
+	const qreal dpr = devicePixelRatioF();
+	const int width = std::max(1, int(std::round(this->width() * dpr)));
+	const int height = std::max(1, int(std::round(this->height() * dpr)));
+	osrPixelWidth_.store(width, std::memory_order_relaxed);
+	osrPixelHeight_.store(height, std::memory_order_relaxed);
+}
+
+void QCefWidgetInternal::PostHostEvent(const std::function<void(CefRefPtr<CefBrowserHost>)> &fn)
+{
+	if (!windowlessMode_ || browserClosing_.load(std::memory_order_relaxed))
+		return;
+
+	CefRefPtr<CefBrowser> browser = cefBrowser;
+	if (!browser)
+		return;
+
+	QueueCEFTask([browser, fn]() {
+		if (!browser)
+			return;
+		CefRefPtr<CefBrowserHost> host = browser->GetHost();
+		if (!host)
+			return;
+		fn(host);
+	});
+}
+
+void QCefWidgetInternal::KickWindowlessRedrawOnce()
+{
+	if (!windowlessMode_)
+		return;
+
+	UpdateOffscreenSizeCache();
+	PostHostEvent([](CefRefPtr<CefBrowserHost> host) {
+		host->WasHidden(false);
+		host->NotifyScreenInfoChanged();
+		host->WasResized();
+		host->Invalidate(PET_VIEW);
+	});
+}
+
+void QCefWidgetInternal::KickWindowlessRedrawBurst(int count, int intervalMs)
+{
+	if (!windowlessMode_ || count < 1)
+		return;
+
+	KickWindowlessRedrawOnce();
+
+	for (int i = 1; i < count; i++) {
+		const int delay = intervalMs * i;
+		QTimer::singleShot(delay, this, [this]() { KickWindowlessRedrawOnce(); });
+	}
+}
+
 #ifdef __linux__
 static bool XWindowHasAtom(Display *display, Window w, Atom a)
 {
@@ -266,6 +351,8 @@ void QCefWidgetInternal::unsetToplevelXdndProxy()
 
 	CefWindowHandle browserHandle = cefBrowser->GetHost()->GetWindowHandle();
 	Display *xDisplay = cef_get_xdisplay();
+	if (!xDisplay)
+		return;
 	Window toplevel, root, parent, *children;
 	unsigned int nChildren;
 	bool found = false;
@@ -306,9 +393,75 @@ void QCefWidgetInternal::unsetToplevelXdndProxy()
 void QCefWidgetInternal::Init()
 {
 #ifndef __APPLE__
+	if (windowlessMode_) {
+		QSize logicalSize = this->size();
+		QSize size = logicalSize * devicePixelRatioF();
+		if (!isVisible() || size.width() < 1 || size.height() < 1) {
+			return;
+		}
+
+		bool success = QueueCEFTask([this]() {
+			CefWindowInfo windowInfo;
+
+			if (cefBrowser)
+				return;
+
+#if CHROME_VERSION_BUILD >= 6533
+			windowInfo.runtime_style = CEF_RUNTIME_STYLE_ALLOY;
+#endif
+			windowInfo.SetAsWindowless(kNullWindowHandle);
+
+			CefRefPtr<QCefBrowserClient> browserClient =
+				new QCefBrowserClient(this, script, allowAllPopups_);
+
+			CefBrowserSettings cefBrowserSettings;
+			cefBrowserSettings.windowless_frame_rate = 60;
+			cefBrowser = CefBrowserHost::CreateBrowserSync(
+				windowInfo, browserClient, url, cefBrowserSettings,
+				CefRefPtr<CefDictionaryValue>(), rqc);
+		});
+
+		if (success) {
+			timer.stop();
+			Resize();
+			KickWindowlessRedrawBurst(6, 120);
+		}
+		return;
+	}
+
+	// Important for Wayland: the QWindow must be embedded first, otherwise
+	// the compositor can map it as a standalone toplevel (floating content).
+	if (!window) {
+		window = new QWindow();
+		window->setFlags(Qt::FramelessWindowHint);
+	}
+	if (!container) {
+		container = QWidget::createWindowContainer(window, this);
+		container->setContentsMargins(0, 0, 0, 0);
+		container->show();
+	}
+	container->setGeometry(QRect(QPoint(0, 0), this->size()));
+
+	if (IsWaylandQtPlatform()) {
+		QWidget *topLevelWidget = container->window();
+		QWindow *topLevelWindow =
+			topLevelWidget ? topLevelWidget->windowHandle() : nullptr;
+		if (!topLevelWindow || !topLevelWidget->isVisible() ||
+		    !topLevelWindow->isExposed() || !container->isVisible()) {
+			// On Wayland, creating the CEF child too early can cause it to be
+			// mapped as an independent toplevel. Wait for full exposure.
+			return;
+		}
+		window->setTransientParent(topLevelWindow);
+	}
+
 	WId handle = window->winId();
-	QSize size = this->size();
-	size *= devicePixelRatioF();
+	QSize logicalSize = this->size();
+	QSize size = logicalSize * devicePixelRatioF();
+	if (!handle || size.width() < 1 || size.height() < 1) {
+		// Keep timer alive; showEvent() already configured retries.
+		return;
+	}
 	bool success = QueueCEFTask(
 		[this, handle, size]()
 #else
@@ -349,11 +502,6 @@ void QCefWidgetInternal::Init()
 	if (success) {
 		timer.stop();
 #ifndef __APPLE__
-		if (!container) {
-			container = QWidget::createWindowContainer(window, this);
-			container->show();
-		}
-
 		Resize();
 #endif
 	}
@@ -363,12 +511,31 @@ void QCefWidgetInternal::resizeEvent(QResizeEvent *event)
 {
 	QWidget::resizeEvent(event);
 #ifndef __APPLE__
+	UpdateOffscreenSizeCache();
 	Resize();
 }
 
 void QCefWidgetInternal::Resize()
 {
-	QSize size = this->size() * devicePixelRatioF();
+	if (windowlessMode_) {
+		UpdateOffscreenSizeCache();
+		PostHostEvent([](CefRefPtr<CefBrowserHost> host) {
+			host->NotifyScreenInfoChanged();
+			host->WasResized();
+			host->Invalidate(PET_VIEW);
+		});
+		return;
+	}
+
+	QSize logicalSize = this->size();
+	if (container)
+		container->setGeometry(QRect(QPoint(0, 0), logicalSize));
+
+	QSize size = logicalSize * devicePixelRatioF();
+	if (size.width() < 1)
+		size.setWidth(1);
+	if (size.height() < 1)
+		size.setHeight(1);
 
 	bool success = QueueCEFTask([this, size]() {
 		if (!cefBrowser)
@@ -386,8 +553,12 @@ void QCefWidgetInternal::Resize()
 #else
 		Display *xDisplay = cef_get_xdisplay();
 
-		if (!xDisplay)
+		if (!xDisplay) {
+			// Wayland path: no X11 display available, but CEF still needs
+			// a resize notification for the child browser surface.
+			cefBrowser->GetHost()->WasResized();
 			return;
+		}
 
 		XWindowChanges changes = {0};
 		changes.x = 0;
@@ -402,7 +573,7 @@ void QCefWidgetInternal::Resize()
 	});
 
 	if (success && container)
-		container->resize(size.width(), size.height());
+		container->resize(logicalSize.width(), logicalSize.height());
 #endif
 }
 
@@ -414,18 +585,352 @@ void QCefWidgetInternal::finishCloseBrowser()
 void QCefWidgetInternal::showEvent(QShowEvent *event)
 {
 	QWidget::showEvent(event);
+	UpdateOffscreenSizeCache();
 
 	if (!cefBrowser) {
 		obs_browser_initialize();
 		connect(&timer, &QTimer::timeout, this, &QCefWidgetInternal::Init);
 		timer.start(500);
 		Init();
+		return;
 	}
+
+	PostHostEvent([](CefRefPtr<CefBrowserHost> host) {
+		host->WasHidden(false);
+		host->NotifyScreenInfoChanged();
+		host->Invalidate(PET_VIEW);
+	});
+	KickWindowlessRedrawBurst(4, 120);
+}
+
+void QCefWidgetInternal::hideEvent(QHideEvent *event)
+{
+	QWidget::hideEvent(event);
+	PostHostEvent([](CefRefPtr<CefBrowserHost> host) { host->WasHidden(true); });
 }
 
 QPaintEngine *QCefWidgetInternal::paintEngine() const
 {
+	if (windowlessMode_) {
+		return QWidget::paintEngine();
+	}
 	return nullptr;
+}
+
+void QCefWidgetInternal::paintEvent(QPaintEvent *event)
+{
+	if (!windowlessMode_) {
+		QWidget::paintEvent(event);
+		return;
+	}
+
+	QImage frame;
+	{
+		std::lock_guard<std::mutex> lock(osrFrameMutex_);
+		frame = osrFrame_;
+	}
+
+	QPainter painter(this);
+	painter.fillRect(rect(), Qt::black);
+	if (!frame.isNull()) {
+		painter.drawImage(rect(), frame);
+	}
+
+	event->accept();
+}
+
+static cef_mouse_button_type_t QtMouseButtonToCef(Qt::MouseButton button)
+{
+	switch (button) {
+	case Qt::RightButton:
+		return MBT_RIGHT;
+	case Qt::MiddleButton:
+		return MBT_MIDDLE;
+	case Qt::LeftButton:
+	default:
+		return MBT_LEFT;
+	}
+}
+
+static uint32_t QtMouseModifiersToCef(Qt::KeyboardModifiers mods,
+				      Qt::MouseButtons buttons)
+{
+	uint32_t flags = EVENTFLAG_NONE;
+	if (mods & Qt::ShiftModifier)
+		flags |= EVENTFLAG_SHIFT_DOWN;
+	if (mods & Qt::ControlModifier)
+		flags |= EVENTFLAG_CONTROL_DOWN;
+	if (mods & Qt::AltModifier)
+		flags |= EVENTFLAG_ALT_DOWN;
+	if (buttons & Qt::LeftButton)
+		flags |= EVENTFLAG_LEFT_MOUSE_BUTTON;
+	if (buttons & Qt::RightButton)
+		flags |= EVENTFLAG_RIGHT_MOUSE_BUTTON;
+	if (buttons & Qt::MiddleButton)
+		flags |= EVENTFLAG_MIDDLE_MOUSE_BUTTON;
+	return flags;
+}
+
+static uint32_t QtKeyboardModifiersToCef(Qt::KeyboardModifiers mods)
+{
+	uint32_t flags = EVENTFLAG_NONE;
+	if (mods & Qt::ShiftModifier)
+		flags |= EVENTFLAG_SHIFT_DOWN;
+	if (mods & Qt::ControlModifier)
+		flags |= EVENTFLAG_CONTROL_DOWN;
+	if (mods & Qt::AltModifier)
+		flags |= EVENTFLAG_ALT_DOWN;
+	if (mods & Qt::MetaModifier)
+		flags |= EVENTFLAG_COMMAND_DOWN;
+	if (mods & Qt::KeypadModifier)
+		flags |= EVENTFLAG_IS_KEY_PAD;
+	return flags;
+}
+
+static CefMouseEvent BuildCefMouseEvent(QWidget *widget, const QPointF &pos,
+					Qt::KeyboardModifiers mods,
+					Qt::MouseButtons buttons)
+{
+	const qreal dpr = widget->devicePixelRatioF();
+	CefMouseEvent event;
+	event.x = int(std::round(pos.x() * dpr));
+	event.y = int(std::round(pos.y() * dpr));
+	event.modifiers = QtMouseModifiersToCef(mods, buttons);
+	return event;
+}
+
+void QCefWidgetInternal::mouseMoveEvent(QMouseEvent *event)
+{
+	if (windowlessMode_) {
+		const CefMouseEvent cefEvent = BuildCefMouseEvent(
+			this, event->position(), event->modifiers(), event->buttons());
+		PostHostEvent([cefEvent](CefRefPtr<CefBrowserHost> host) {
+			host->SendMouseMoveEvent(cefEvent, false);
+		});
+	}
+
+	QWidget::mouseMoveEvent(event);
+}
+
+void QCefWidgetInternal::mousePressEvent(QMouseEvent *event)
+{
+	if (windowlessMode_) {
+		setFocus(Qt::MouseFocusReason);
+		const CefMouseEvent cefEvent = BuildCefMouseEvent(
+			this, event->position(), event->modifiers(), event->buttons());
+		const cef_mouse_button_type_t button = QtMouseButtonToCef(event->button());
+		PostHostEvent([cefEvent, button](CefRefPtr<CefBrowserHost> host) {
+			host->SendMouseClickEvent(cefEvent, button, false, 1);
+		});
+	}
+
+	QWidget::mousePressEvent(event);
+}
+
+void QCefWidgetInternal::mouseReleaseEvent(QMouseEvent *event)
+{
+	if (windowlessMode_) {
+		const CefMouseEvent cefEvent = BuildCefMouseEvent(
+			this, event->position(), event->modifiers(), event->buttons());
+		const cef_mouse_button_type_t button = QtMouseButtonToCef(event->button());
+		PostHostEvent([cefEvent, button](CefRefPtr<CefBrowserHost> host) {
+			host->SendMouseClickEvent(cefEvent, button, true, 1);
+		});
+	}
+
+	QWidget::mouseReleaseEvent(event);
+}
+
+void QCefWidgetInternal::wheelEvent(QWheelEvent *event)
+{
+	if (windowlessMode_) {
+		const CefMouseEvent cefEvent = BuildCefMouseEvent(
+			this, event->position(), event->modifiers(), event->buttons());
+		const QPoint delta = event->angleDelta();
+		PostHostEvent([cefEvent, delta](CefRefPtr<CefBrowserHost> host) {
+			host->SendMouseWheelEvent(cefEvent, delta.x(), delta.y());
+		});
+	}
+
+	QWidget::wheelEvent(event);
+}
+
+void QCefWidgetInternal::enterEvent(QEnterEvent *event)
+{
+	if (windowlessMode_) {
+		const CefMouseEvent cefEvent = BuildCefMouseEvent(
+			this, event->position(), Qt::NoModifier, Qt::NoButton);
+		PostHostEvent([cefEvent](CefRefPtr<CefBrowserHost> host) {
+			host->SendMouseMoveEvent(cefEvent, false);
+		});
+	}
+
+	QWidget::enterEvent(event);
+}
+
+void QCefWidgetInternal::leaveEvent(QEvent *event)
+{
+	if (windowlessMode_) {
+		CefMouseEvent cefEvent;
+		cefEvent.x = 0;
+		cefEvent.y = 0;
+		cefEvent.modifiers = EVENTFLAG_NONE;
+		PostHostEvent([cefEvent](CefRefPtr<CefBrowserHost> host) {
+			host->SendMouseMoveEvent(cefEvent, true);
+		});
+	}
+
+	QWidget::leaveEvent(event);
+}
+
+void QCefWidgetInternal::focusInEvent(QFocusEvent *event)
+{
+	if (windowlessMode_) {
+		PostHostEvent([](CefRefPtr<CefBrowserHost> host) {
+			host->SetFocus(true);
+		});
+	}
+
+	QWidget::focusInEvent(event);
+}
+
+void QCefWidgetInternal::focusOutEvent(QFocusEvent *event)
+{
+	if (windowlessMode_) {
+		PostHostEvent([](CefRefPtr<CefBrowserHost> host) {
+			host->SetFocus(false);
+		});
+	}
+
+	QWidget::focusOutEvent(event);
+}
+
+static CefKeyEvent BuildCefKeyEventBase(QKeyEvent *event, cef_key_event_type_t type)
+{
+	CefKeyEvent cefEvent;
+	cefEvent.type = type;
+
+	uint32_t nativeVKey = static_cast<uint32_t>(event->nativeVirtualKey());
+	if (nativeVKey == 0) {
+		nativeVKey = static_cast<uint32_t>(event->key());
+	}
+
+#if !defined(_WIN32) && !defined(__APPLE__)
+	cefEvent.windows_key_code = KeyboardCodeFromXKeysym(nativeVKey);
+#else
+	cefEvent.windows_key_code = nativeVKey;
+#endif
+
+	cefEvent.native_key_code = static_cast<int>(event->nativeScanCode());
+	cefEvent.modifiers = QtKeyboardModifiersToCef(event->modifiers());
+
+	return cefEvent;
+}
+
+void QCefWidgetInternal::keyPressEvent(QKeyEvent *event)
+{
+	if (windowlessMode_) {
+		setFocus(Qt::OtherFocusReason);
+
+		CefKeyEvent rawEvent = BuildCefKeyEventBase(event, KEYEVENT_RAWKEYDOWN);
+		const QString text = event->text();
+
+		bool sendChar = false;
+		CefKeyEvent charEvent;
+		if (!text.isEmpty()) {
+			const auto codepoints = text.toUcs4();
+			if (!codepoints.isEmpty()) {
+				const uint32_t cp = codepoints.front();
+				charEvent = rawEvent;
+				charEvent.type = KEYEVENT_CHAR;
+				charEvent.character = static_cast<char16_t>(cp);
+				charEvent.unmodified_character = static_cast<char16_t>(cp);
+#if !defined(_WIN32) && !defined(__APPLE__)
+				charEvent.windows_key_code = KeyboardCodeFromXKeysym(cp);
+#else
+				charEvent.windows_key_code = cp;
+#endif
+				sendChar = true;
+			}
+		}
+
+		PostHostEvent([rawEvent, charEvent, sendChar](CefRefPtr<CefBrowserHost> host) {
+			host->SendKeyEvent(rawEvent);
+			if (sendChar) {
+				host->SendKeyEvent(charEvent);
+			}
+		});
+
+		event->accept();
+		return;
+	}
+
+	QWidget::keyPressEvent(event);
+}
+
+void QCefWidgetInternal::keyReleaseEvent(QKeyEvent *event)
+{
+	if (windowlessMode_) {
+		const CefKeyEvent keyUpEvent = BuildCefKeyEventBase(event, KEYEVENT_KEYUP);
+		PostHostEvent([keyUpEvent](CefRefPtr<CefBrowserHost> host) {
+			host->SendKeyEvent(keyUpEvent);
+		});
+		event->accept();
+		return;
+	}
+
+	QWidget::keyReleaseEvent(event);
+}
+
+void QCefWidgetInternal::inputMethodEvent(QInputMethodEvent *event)
+{
+	if (windowlessMode_) {
+		const QString committed = event->commitString();
+		if (!committed.isEmpty()) {
+			const auto codepoints = committed.toUcs4();
+			for (const uint32_t cp : codepoints) {
+				CefKeyEvent charEvent;
+				charEvent.type = KEYEVENT_CHAR;
+				charEvent.character = static_cast<char16_t>(cp);
+				charEvent.unmodified_character = static_cast<char16_t>(cp);
+#if !defined(_WIN32) && !defined(__APPLE__)
+				charEvent.windows_key_code = KeyboardCodeFromXKeysym(cp);
+#else
+				charEvent.windows_key_code = cp;
+#endif
+				charEvent.modifiers = QtKeyboardModifiersToCef(QGuiApplication::keyboardModifiers());
+
+				PostHostEvent([charEvent](CefRefPtr<CefBrowserHost> host) {
+					host->SendKeyEvent(charEvent);
+				});
+			}
+		}
+
+		event->accept();
+		return;
+	}
+
+	QWidget::inputMethodEvent(event);
+}
+
+void QCefWidgetInternal::UpdateOffscreenFrame(const void *buffer, int width,
+					      int height)
+{
+	if (!windowlessMode_ || browserClosing_.load(std::memory_order_relaxed) ||
+	    !buffer || width < 1 || height < 1)
+		return;
+
+	QImage frame((const uchar *)buffer, width, height, width * 4,
+		     QImage::Format_ARGB32);
+	QImage frameCopy = frame.copy();
+
+	{
+		std::lock_guard<std::mutex> lock(osrFrameMutex_);
+		osrFrame_ = std::move(frameCopy);
+	}
+
+	QMetaObject::invokeMethod(this, [this]() { update(); },
+				  Qt::QueuedConnection);
 }
 
 void QCefWidgetInternal::setURL(const std::string &url_)

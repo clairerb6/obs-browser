@@ -11,6 +11,8 @@
 #include <QRegularExpression>
 #include <QLabel>
 #include <QClipboard>
+#include <algorithm>
+#include <cmath>
 
 #include <obs-module.h>
 #ifdef _WIN32
@@ -68,10 +70,18 @@ CefRefPtr<CefJSDialogHandler> QCefBrowserClient::GetJSDialogHandler()
 	return this;
 }
 
+CefRefPtr<CefRenderHandler> QCefBrowserClient::GetRenderHandler()
+{
+	if (widget && widget->isWindowlessMode()) {
+		return this;
+	}
+	return nullptr;
+}
+
 /* CefDisplayHandler */
 void QCefBrowserClient::OnTitleChange(CefRefPtr<CefBrowser> browser, const CefString &title)
 {
-	if (widget && widget->cefBrowser->IsSame(browser)) {
+	if (widget && widget->cefBrowser && widget->cefBrowser->IsSame(browser)) {
 		std::string str_title = title;
 		QString qt_title = QString::fromUtf8(str_title.c_str());
 		QMetaObject::invokeMethod(widget, "titleChanged", Q_ARG(QString, qt_title));
@@ -396,6 +406,41 @@ void QCefBrowserClient::OnLoadEnd(CefRefPtr<CefBrowser>, CefRefPtr<CefFrame> fra
 		frame->ExecuteJavaScript(widget->script, CefString(), 0);
 	else if (!script.empty())
 		frame->ExecuteJavaScript(script, CefString(), 0);
+
+	if (widget && widget->isWindowlessMode()) {
+		QMetaObject::invokeMethod(
+			widget, [w = QPointer<QCefWidgetInternal>(widget)]() {
+				if (w) {
+					w->KickWindowlessRedrawBurst(8, 120);
+				}
+			},
+			Qt::QueuedConnection);
+	}
+}
+
+void QCefBrowserClient::GetViewRect(CefRefPtr<CefBrowser>, CefRect &rect)
+{
+	if (!widget) {
+		rect.Set(0, 0, 1, 1);
+		return;
+	}
+
+	const QSize pixelSize = widget->GetOffscreenPixelSize();
+	const int width = std::max(1, pixelSize.width());
+	const int height = std::max(1, pixelSize.height());
+	rect.Set(0, 0, width, height);
+}
+
+void QCefBrowserClient::OnPaint(CefRefPtr<CefBrowser>, PaintElementType type,
+				const RectList &, const void *buffer, int width,
+				int height)
+{
+	if (!widget || widget->IsShuttingDown() || type != PET_VIEW || !buffer ||
+	    width < 1 || height < 1) {
+		return;
+	}
+
+	widget->UpdateOffscreenFrame(buffer, width, height);
 }
 
 bool QCefBrowserClient::OnJSDialog(CefRefPtr<CefBrowser>, const CefString &,
@@ -403,7 +448,10 @@ bool QCefBrowserClient::OnJSDialog(CefRefPtr<CefBrowser>, const CefString &,
 				   const CefString &default_prompt_text, CefRefPtr<CefJSDialogCallback> callback,
 				   bool &)
 {
-	QString parentTitle = widget->parentWidget()->windowTitle();
+	QString parentTitle = QStringLiteral("OBS");
+	if (widget && widget->parentWidget()) {
+		parentTitle = widget->parentWidget()->windowTitle();
+	}
 	std::string default_value = default_prompt_text;
 	QString msg_raw(message_text.ToString().c_str());
 	// Replace <br> with standard newline as we will render in plaintext
