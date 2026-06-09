@@ -81,10 +81,10 @@ void BrowserApp::OnBeforeCommandLineProcessing(const CefString &, CefRefPtr<CefC
 #ifdef _WIN32
 		disableFeatures += ",EnableWindowsGamingInputDataFetcher";
 #endif
-		disableFeatures += ",WebBluetooth";
+		disableFeatures += ",WebBluetooth,WebHID,WebUSB,WebSerial";
 		command_line->AppendSwitchWithValue("disable-features", disableFeatures);
 	} else {
-		command_line->AppendSwitchWithValue("disable-features", "WebBluetooth,"
+		command_line->AppendSwitchWithValue("disable-features", "WebBluetooth,WebHID,WebUSB,WebSerial,"
 #ifdef _WIN32
 									"EnableWindowsGamingInputDataFetcher,"
 #endif
