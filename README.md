@@ -6,6 +6,17 @@ Additionally, obs-browser enables Service Integration (linking third party servi
 
 **This plugin is included by default** on official packages on Windows, macOS, the Ubuntu PPA and the official [Flatpak](https://flathub.org/apps/details/com.obsproject.Studio) (most Linux distributions).
 
+## Linux fork note
+
+For the custom Linux port flow maintained alongside `obs-streamelements-core`,
+see:
+
+- [README-linux-release.md](README-linux-release.md)
+
+That note documents the release packaging stance for this fork's Linux
+prebuilt artifacts, including why they should stay target-specific and
+separate from `obs-streamelements-core`.
+
 ## JS Bindings
 
 obs-browser provides a global object that allows access to some OBS-specific functionality from JavaScript. This can be used to create an overlay that adapts dynamically to changes in OBS.
