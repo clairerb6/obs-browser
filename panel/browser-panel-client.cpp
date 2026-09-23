@@ -40,6 +40,13 @@ CefRefPtr<CefDisplayHandler> QCefBrowserClient::GetDisplayHandler()
 	return this;
 }
 
+#if CHROME_VERSION_BUILD >= 6533
+CefRefPtr<CefCommandHandler> QCefBrowserClient::GetCommandHandler()
+{
+	return this;
+}
+#endif
+
 CefRefPtr<CefRequestHandler> QCefBrowserClient::GetRequestHandler()
 {
 	return this;
@@ -77,6 +84,14 @@ CefRefPtr<CefRenderHandler> QCefBrowserClient::GetRenderHandler()
 	}
 	return nullptr;
 }
+
+/* CefCommandHandler */
+#if CHROME_VERSION_BUILD >= 6533
+bool QCefBrowserClient::OnChromeCommand(CefRefPtr<CefBrowser>, int, cef_window_open_disposition_t)
+{
+	return true;
+}
+#endif
 
 /* CefDisplayHandler */
 void QCefBrowserClient::OnTitleChange(CefRefPtr<CefBrowser> browser, const CefString &title)

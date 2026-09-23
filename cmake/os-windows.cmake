@@ -13,8 +13,8 @@ add_executable(OBS::browser-helper ALIAS obs-browser-helper)
 target_sources(
   obs-browser-helper
   PRIVATE # cmake-format: sortable
-          browser-app.cpp browser-app.hpp cef-headers.hpp obs-browser-page.manifest
-          obs-browser-page/obs-browser-page-main.cpp)
+          browser-app.cpp browser-app.hpp browser-dummy-client.cpp browser-dummy-client.hpp
+          cef-headers.hpp obs-browser-page.manifest obs-browser-page/obs-browser-page-main.cpp)
 
 configure_file(cmake/windows/obs-module-helper.rc.in obs-browser-page.rc)
 target_sources(obs-browser-helper PRIVATE obs-browser-page.rc)
@@ -24,6 +24,7 @@ target_include_directories(obs-browser-helper PRIVATE "${CMAKE_CURRENT_SOURCE_DI
 
 target_compile_options(obs-browser-helper PRIVATE $<IF:$<CONFIG:DEBUG>,/MTd,/MT>)
 target_compile_definitions(obs-browser-helper PRIVATE ENABLE_BROWSER_SHARED_TEXTURE)
+target_compile_features(obs-browser-helper PRIVATE cxx_std_20)
 
 target_link_libraries(obs-browser-helper PRIVATE CEF::Wrapper CEF::Library nlohmann_json::nlohmann_json)
 target_link_options(obs-browser-helper PRIVATE /IGNORE:4099 /SUBSYSTEM:WINDOWS)
